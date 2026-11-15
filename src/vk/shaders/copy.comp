@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// Strided N-d copy (rank <= 8): dst[dst_off + sum c_d*ds_d] = src[src_off + sum c_d*ss_d].
+// Used for permute, broadcast_to, slice and concat.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer S { float src[]; };
+layout(binding = 1) writeonly buffer D { float dst[]; };
+layout(push_constant) uniform PC {
+  uint n; uint rank; uint src_off; uint dst_off;
+  uint shape[8]; uint ss[8]; uint ds[8];
+} pc;
+void main() {
+  uint i = um_linear_group() * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.n) return;
+  uint rem = i, si = pc.src_off, di = pc.dst_off;
+  for (int d = int(pc.rank) - 1; d >= 0; --d) {
+    uint s = pc.shape[d];
+    uint c = rem % s;
+    rem /= s;
+    si += c * pc.ss[d];
+    di += c * pc.ds[d];
+  }
+  dst[di] = src[si];
+}

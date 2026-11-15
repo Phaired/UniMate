@@ -1,0 +1,13 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// y = op(x) elementwise (op 100 = affine: x * scale + shift).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint n; uint op; float scale; float shift; } pc;
+void main() {
+  uint i = um_linear_group() * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.n) return;
+  y[i] = um_unary(pc.op, x[i], pc.scale, pc.shift);
+}

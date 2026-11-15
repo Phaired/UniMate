@@ -1,0 +1,29 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// Reduce over the middle axis of [outer, R, inner] (inner > 1); one thread per output.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint n; uint inner; uint R; uint op; } pc;
+void main() {
+  uint i = um_linear_group() * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.n) return;
+  uint o = i / pc.inner, in_ = i - o * pc.inner;
+  uint base = o * pc.R * pc.inner + in_;
+  float acc = pc.op == 2u ? -UM_INF : (pc.op == 3u ? UM_INF : 0.0);
+  precise float comp = 0.0;  // Kahan compensation (long sequential sums)
+  for (uint r = 0u; r < pc.R; ++r) {
+    float v = x[base + r * pc.inner];
+    if (pc.op <= 1u) {
+      precise float y = v - comp;
+      precise float t = acc + y;
+      comp = (t - acc) - y;
+      acc = t;
+    }
+    else if (pc.op == 2u) acc = (v > acc || isnan(v)) ? v : acc;
+    else acc = (v < acc || isnan(v)) ? v : acc;
+  }
+  if (pc.op == 1u) acc /= float(pc.R);
+  y[i] = acc;
+}

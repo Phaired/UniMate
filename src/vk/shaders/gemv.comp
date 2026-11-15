@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+#include "common.glsl"
+// Skinny linear: out[m, n] = sum_k X[m, k] * W[n, k] + bias[n] for M <= 8.
+// Memory bound on W: one subgroup per output column streams W[n, :] once.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X_ { float X[]; };
+layout(binding = 1) readonly buffer W_ { float W[]; };
+layout(binding = 2) readonly buffer Bias_ { float bias[]; };
+layout(binding = 3) writeonly buffer O_ { float O[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint has_bias; uint cols_per_wg; } pc;
+void main() {
+  uint wg = um_linear_group();
+  uint lane = gl_SubgroupInvocationID, step = gl_SubgroupSize;
+  for (uint c = gl_SubgroupID; c < pc.cols_per_wg; c += gl_NumSubgroups) {
+    uint n = wg * pc.cols_per_wg + c;
+    if (n >= pc.N) break;
+    float acc[8];
+    [[unroll]] for (uint m = 0u; m < 8u; ++m) acc[m] = 0.0;
+    uint wb = n * pc.K;
+    for (uint k = lane; k < pc.K; k += step) {
+      float w = W[wb + k];
+      [[unroll]] for (uint m = 0u; m < 8u; ++m)
+        if (m < pc.M) acc[m] += X[m * pc.K + k] * w;
+    }
+    float bv = pc.has_bias != 0u ? bias[n] : 0.0;
+    [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+      if (m < pc.M) {
+        float s = subgroupAdd(acc[m]);
+        if (lane == 0u) O[m * pc.N + n] = s + bv;
+      }
+    }
+  }
+}

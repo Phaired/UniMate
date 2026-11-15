@@ -1,0 +1,7 @@
+build/
+.venv/
+models/
+reference/
+tests/golden/
+__pycache__/
+*.pyc

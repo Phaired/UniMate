@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// out = a (op) b with NumPy broadcasting. mode 0: a, b, out all contiguous
+// with the same shape; mode 1: strided (rank <= 8, stride 0 = broadcast).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+  uint n; uint op; uint rank; uint mode;
+  uint shape[8]; uint sa[8]; uint sb[8];
+} pc;
+void main() {
+  uint i = um_linear_group() * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.n) return;
+  uint ia = i, ib = i;
+  if (pc.mode != 0u) {
+    uint rem = i;
+    ia = 0u; ib = 0u;
+    for (int d = int(pc.rank) - 1; d >= 0; --d) {
+      uint s = pc.shape[d];
+      uint c = rem % s;
+      rem /= s;
+      ia += c * pc.sa[d];
+      ib += c * pc.sb[d];
+    }
+  }
+  o[i] = um_binary(pc.op, a[ia], b[ib]);
+}

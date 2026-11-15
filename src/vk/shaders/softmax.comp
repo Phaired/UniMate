@@ -1,0 +1,27 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "common.glsl"
+// Softmax over contiguous rows; one subgroup per row.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint len; uint rows_per_wg; } pc;
+void main() {
+  uint wg = um_linear_group();
+  uint lane = gl_SubgroupInvocationID, step = gl_SubgroupSize;
+  for (uint r = gl_SubgroupID; r < pc.rows_per_wg; r += gl_NumSubgroups) {
+    uint row = wg * pc.rows_per_wg + r;
+    if (row >= pc.rows) break;
+    uint base = row * pc.len;
+    float m = -UM_INF;
+    for (uint j = lane; j < pc.len; j += step) m = max(m, x[base + j]);
+    m = subgroupMax(m);
+    float s = 0.0;
+    for (uint j = lane; j < pc.len; j += step) s += um_exp(x[base + j] - m);
+    s = subgroupAdd(s);
+    float inv = 1.0 / s;
+    for (uint j = lane; j < pc.len; j += step) y[base + j] = um_exp(x[base + j] - m) * inv;
+  }
+}

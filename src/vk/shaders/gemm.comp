@@ -1,0 +1,148 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// Batched C[z] = A[z] (MxK, row-major) * op(B[z]) + bias, C contiguous.
+//   TRANS_B = 0: B is [K, N] (matmul)      TRANS_B = 1: B is [N, K] (nn.Linear weight)
+// Shared-memory blocked tiles BMxBN, k-step BK; each thread owns a TMxTN
+// micro-tile laid out as (TM/4)x(TN/4) groups of 4x4 spread across the tile so
+// shared reads are vec4 and bank-conflict free. Global->shared loads are
+// double-buffered through registers.
+layout(constant_id = 0) const uint BM = 128;
+layout(constant_id = 1) const uint BN = 128;
+layout(constant_id = 2) const uint BK = 8;
+layout(constant_id = 3) const uint TM = 8;
+layout(constant_id = 4) const uint TN = 8;
+layout(constant_id = 5) const uint TRANS_B = 0;
+layout(local_size_x_id = 6) in;  // must equal (BM/TM)*(BN/TN)
+
+layout(binding = 0) readonly buffer A_ { float A[]; };
+layout(binding = 1) readonly buffer B_ { float B[]; };
+layout(binding = 2) readonly buffer Bias_ { float bias[]; };
+layout(binding = 3) writeonly buffer C_ { float C[]; };
+layout(push_constant) uniform PC {
+  uint M; uint N; uint K; uint has_bias;
+  uint nbatch; uint nbd; uint pad0; uint pad1;
+  uint bshape[4]; uint sa[4]; uint sb[4];
+} pc;
+
+const uint TX = BN / TN;
+const uint TY = BM / TM;
+const uint NT = TX * TY;
+const uint RG = TM / 4;
+const uint CG = TN / 4;
+const uint ASTR = BM + 4;  // padded k-row stride of As (floats)
+const uint A_PER = (BM * BK) / NT;
+const uint B_PER = (BN * BK) / NT;
+
+shared vec4 As[(BK * ASTR) / 4];
+shared vec4 Bs[(BK * BN) / 4];
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x;
+  const uint tx = tid % TX, ty = tid / TX;
+  const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+  const uint M = pc.M, N = pc.N, K = pc.K;
+
+  for (uint z = gl_WorkGroupID.z; z < pc.nbatch; z += gl_NumWorkGroups.z) {
+    uint rem = z, offA = 0u, offB = 0u;
+    for (int d = int(pc.nbd) - 1; d >= 0; --d) {
+      uint c = rem % pc.bshape[d];
+      rem /= pc.bshape[d];
+      offA += c * pc.sa[d];
+      offB += c * pc.sb[d];
+    }
+    const uint offC = z * M * N;
+
+    float acc[TM * TN];
+    [[unroll]] for (uint i = 0u; i < TM * TN; ++i) acc[i] = 0.0;
+    float ra[A_PER];
+    float rb[B_PER];
+
+    // ---- load tile 0 into registers
+    [[unroll]] for (uint i = 0u; i < A_PER; ++i) {
+      uint e = tid + i * NT;
+      uint row = e / BK, kk = e % BK;
+      uint gm = m0 + row, gk = kk;
+      ra[i] = (gm < M && gk < K) ? A[offA + gm * K + gk] : 0.0;
+    }
+    [[unroll]] for (uint i = 0u; i < B_PER; ++i) {
+      uint e = tid + i * NT;
+      if (TRANS_B == 0u) {
+        uint kk = e / BN, col = e % BN;
+        uint gn = n0 + col, gk = kk;
+        rb[i] = (gn < N && gk < K) ? B[offB + gk * N + gn] : 0.0;
+      } else {
+        uint col = e / BK, kk = e % BK;
+        uint gn = n0 + col, gk = kk;
+        rb[i] = (gn < N && gk < K) ? B[offB + gn * K + gk] : 0.0;
+      }
+    }
+
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+      // registers -> shared
+      [[unroll]] for (uint i = 0u; i < A_PER; ++i) {
+        uint e = tid + i * NT;
+        uint row = e / BK, kk = e % BK;
+        uint f = kk * ASTR + row;
+        As[f / 4u][f % 4u] = ra[i];
+      }
+      [[unroll]] for (uint i = 0u; i < B_PER; ++i) {
+        uint e = tid + i * NT;
+        uint col, kk;
+        if (TRANS_B == 0u) { kk = e / BN; col = e % BN; } else { col = e / BK; kk = e % BK; }
+        uint f = kk * BN + col;
+        Bs[f / 4u][f % 4u] = rb[i];
+      }
+      barrier();
+      // prefetch next tile into registers
+      uint k1 = k0 + BK;
+      if (k1 < K) {
+        [[unroll]] for (uint i = 0u; i < A_PER; ++i) {
+          uint e = tid + i * NT;
+          uint row = e / BK, kk = e % BK;
+          uint gm = m0 + row, gk = k1 + kk;
+          ra[i] = (gm < M && gk < K) ? A[offA + gm * K + gk] : 0.0;
+        }
+        [[unroll]] for (uint i = 0u; i < B_PER; ++i) {
+          uint e = tid + i * NT;
+          if (TRANS_B == 0u) {
+            uint kk = e / BN, col = e % BN;
+            uint gn = n0 + col, gk = k1 + kk;
+            rb[i] = (gn < N && gk < K) ? B[offB + gk * N + gn] : 0.0;
+          } else {
+            uint col = e / BK, kk = e % BK;
+            uint gn = n0 + col, gk = k1 + kk;
+            rb[i] = (gn < N && gk < K) ? B[offB + gn * K + gk] : 0.0;
+          }
+        }
+      }
+      // compute
+      [[unroll]] for (uint kk = 0u; kk < BK; ++kk) {
+        vec4 a[RG];
+        vec4 b[CG];
+        [[unroll]] for (uint g = 0u; g < RG; ++g) a[g] = As[(kk * ASTR) / 4u + g * TY + ty];
+        [[unroll]] for (uint g = 0u; g < CG; ++g) b[g] = Bs[(kk * BN) / 4u + g * TX + tx];
+        [[unroll]] for (uint gi = 0u; gi < RG; ++gi)
+          [[unroll]] for (uint ii = 0u; ii < 4u; ++ii)
+            [[unroll]] for (uint gj = 0u; gj < CG; ++gj)
+              [[unroll]] for (uint jj = 0u; jj < 4u; ++jj)
+                acc[(gi * 4u + ii) * TN + gj * 4u + jj] += a[gi][ii] * b[gj][jj];
+      }
+      barrier();
+    }
+
+    [[unroll]] for (uint gi = 0u; gi < RG; ++gi)
+      [[unroll]] for (uint ii = 0u; ii < 4u; ++ii) {
+        uint row = m0 + gi * TY * 4u + ty * 4u + ii;
+        if (row >= M) continue;
+        [[unroll]] for (uint gj = 0u; gj < CG; ++gj)
+          [[unroll]] for (uint jj = 0u; jj < 4u; ++jj) {
+            uint col = n0 + gj * TX * 4u + tx * 4u + jj;
+            if (col < N) {
+              float v = acc[(gi * 4u + ii) * TN + gj * 4u + jj];
+              if (pc.has_bias != 0u) v += bias[col];
+              C[offC + row * N + col] = v;
+            }
+          }
+      }
+  }
+}

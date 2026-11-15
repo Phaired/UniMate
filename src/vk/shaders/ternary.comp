@@ -1,0 +1,43 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// Fused broadcast ternary ops, out contiguous with `shape` (rank <= 6):
+//   op 0 (rope):     out = x * a + rotate_half(x) * b        (a = cos, b = sin)
+//                    rotate_half(x)[i] = i < d-h ? -x[i+h] : x[i-(d-h)], h = d/2
+//                    over the last axis (never collapsed by the host).
+//   op 1 (modulate): out = x * (1 + b) + a                   (a = shift, b = scale)
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer A { float a[]; };
+layout(binding = 2) readonly buffer B { float b[]; };
+layout(binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+  uint n; uint rank; uint op; uint pad;
+  uint shape[6]; uint sx[6]; uint sa[6]; uint sb[6];
+} pc;
+void main() {
+  uint i = um_linear_group() * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.n) return;
+  uint rem = i, ix = 0u, ia = 0u, ib = 0u, clast = 0u;
+  for (int d = int(pc.rank) - 1; d >= 0; --d) {
+    uint s = pc.shape[d];
+    uint c = rem % s;
+    rem /= s;
+    if (d == int(pc.rank) - 1) clast = c;
+    ix += c * pc.sx[d];
+    ia += c * pc.sa[d];
+    ib += c * pc.sb[d];
+  }
+  float xv = x[ix];
+  if (pc.op == 0u) {
+    uint dl = pc.shape[pc.rank - 1u];
+    uint h = dl / 2u, hh = dl - h;
+    uint sl = pc.sx[pc.rank - 1u];
+    float rot = clast < hh ? -x[ix + h * sl] : x[ix - hh * sl];
+    precise float r = xv * a[ia] + rot * b[ib];
+    o[i] = r;
+  } else {
+    precise float r = xv * (1.0 + b[ib]) + a[ia];
+    o[i] = r;
+  }
+}

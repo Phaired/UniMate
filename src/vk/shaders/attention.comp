@@ -1,0 +1,175 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#include "common.glsl"
+// Fused attention: out = softmax(q k^T * scale + bias) v  (flash-attention v1
+// style, fp32). One workgroup (128 threads) per (batch, block of BQ=32 query
+// rows); key/value tiles of TK rows are staged in shared memory and an online
+// softmax is carried per query row.
+//   phase 1: S[32 x TK] = Q K^T * scale + bias   (each thread a 2 x TK/8 block)
+//   phase 2: per row: running max / sum, P = exp(S - m), rescale factor
+//   phase 3: O[32 x DV] = O * corr + P V           (fixed per-thread ownership)
+// q [batch.., Lq, D], k [batch.., Lk, D], v [batch.., Lk, DV] row-contiguous;
+// bias broadcast to [batch.., Lq, Lk] via strides; out [batch.., Lq, DV].
+// D and DV are multiples of 4.
+layout(constant_id = 0) const uint D = 64;
+layout(constant_id = 1) const uint DV = 64;
+layout(constant_id = 2) const uint TK = 32;  // multiple of 8
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer Q_ { float Q[]; };
+layout(binding = 1) readonly buffer K_ { float Kb[]; };
+layout(binding = 2) readonly buffer V_ { float Vb[]; };
+layout(binding = 3) readonly buffer Bias_ { float bias[]; };
+layout(binding = 4) writeonly buffer O_ { float O[]; };
+layout(push_constant) uniform PC {
+  uint Lq; uint Lk; uint nbd; uint has_bias;
+  uint bshape[4]; uint sq[4]; uint sk[4]; uint sv[4]; uint sbias[4];
+  uint bias_sq; uint bias_sk; float scale; uint nbatch;
+} pc;
+
+const uint NTH = 128u;
+const uint BQ = 32u;
+const uint D4 = D / 4u;
+const uint DS = D4 + 1u;  // padded row stride (vec4) of Qs / Ks
+const uint DV4 = DV / 4u;
+const uint CJ = TK / 8u;  // phase-1 columns per thread
+const uint PS = TK + 1u;  // padded row stride of Ps
+const uint NA = (BQ * DV4 + NTH - 1u) / NTH;  // phase-3 vec4 accumulators per thread
+
+shared vec4 Qs[BQ * DS];
+shared vec4 Ks[TK * DS];
+shared vec4 Vs[TK * DV4];
+shared float Ps[BQ * PS];
+shared float rowm[BQ];
+shared float rowl[BQ];
+shared float rowc[BQ];
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x;
+  const uint z = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+  if (z >= pc.nbatch) return;  // uniform across the workgroup
+  uint rem = z, oq = 0u, ok = 0u, ov = 0u, ob = 0u;
+  for (int d = int(pc.nbd) - 1; d >= 0; --d) {
+    uint c = rem % pc.bshape[d];
+    rem /= pc.bshape[d];
+    oq += c * pc.sq[d];
+    ok += c * pc.sk[d];
+    ov += c * pc.sv[d];
+    ob += c * pc.sbias[d];
+  }
+  const uint q0 = gl_WorkGroupID.x * BQ;
+  const uint Lq = pc.Lq, Lk = pc.Lk;
+
+  for (uint e = tid; e < BQ * D4; e += NTH) {
+    uint r = e / D4, c = e - r * D4;
+    uint g = oq + (q0 + r) * D + c * 4u;
+    Qs[r * DS + c] = (q0 + r < Lq) ? vec4(Q[g], Q[g + 1u], Q[g + 2u], Q[g + 3u]) : vec4(0.0);
+  }
+  if (tid < BQ) {
+    rowm[tid] = -UM_INF;
+    rowl[tid] = 0.0;
+  }
+  vec4 acc[NA];
+  [[unroll]] for (uint a = 0u; a < NA; ++a) acc[a] = vec4(0.0);
+
+  const uint pr = tid / 8u, pc8 = tid % 8u;  // phase-1 coordinates
+
+  for (uint kt = 0u; kt < Lk; kt += TK) {
+    const uint nk = min(TK, Lk - kt);
+    for (uint e = tid; e < TK * D4; e += NTH) {
+      uint r = e / D4, c = e - r * D4;
+      uint g = ok + (kt + r) * D + c * 4u;
+      Ks[r * DS + c] = r < nk ? vec4(Kb[g], Kb[g + 1u], Kb[g + 2u], Kb[g + 3u]) : vec4(0.0);
+    }
+    for (uint e = tid; e < TK * DV4; e += NTH) {
+      uint r = e / DV4;
+      uint g = ov + kt * DV + e * 4u;
+      Vs[e] = r < nk ? vec4(Vb[g], Vb[g + 1u], Vb[g + 2u], Vb[g + 3u]) : vec4(0.0);
+    }
+    barrier();
+
+    // ---- phase 1: scores
+    {
+      float s[2][CJ];
+      [[unroll]] for (uint i = 0u; i < 2u; ++i)
+        [[unroll]] for (uint j = 0u; j < CJ; ++j) s[i][j] = 0.0;
+      [[unroll]] for (uint c = 0u; c < D4; ++c) {
+        vec4 qa = Qs[pr * DS + c];
+        vec4 qb = Qs[(pr + 16u) * DS + c];
+        [[unroll]] for (uint j = 0u; j < CJ; ++j) {
+          vec4 kv = Ks[(pc8 + 8u * j) * DS + c];
+          s[0][j] += dot(qa, kv);
+          s[1][j] += dot(qb, kv);
+        }
+      }
+      [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+        uint row = pr + 16u * i;
+        uint qrow = q0 + row;
+        [[unroll]] for (uint j = 0u; j < CJ; ++j) {
+          uint col = pc8 + 8u * j;
+          precise float v = s[i][j] * pc.scale;
+          if (pc.has_bias != 0u && qrow < Lq && col < nk)
+            v = v + bias[ob + qrow * pc.bias_sq + (kt + col) * pc.bias_sk];
+          Ps[row * PS + col] = col < nk ? v : -UM_INF;
+        }
+      }
+    }
+    barrier();
+
+    // ---- phase 2: online softmax bookkeeping, one thread per row
+    if (tid < BQ) {
+      const uint row = tid;
+      float m = rowm[row];
+      float tmax = -UM_INF;
+      for (uint c = 0u; c < nk; ++c) tmax = max(tmax, Ps[row * PS + c]);
+      float mnew = max(m, tmax);
+      if (mnew > -UM_INF) {
+        float corr = um_exp(m - mnew);
+        float l = rowl[row] * corr;
+        for (uint c = 0u; c < TK; ++c) {
+          float p = c < nk ? um_exp(Ps[row * PS + c] - mnew) : 0.0;
+          Ps[row * PS + c] = p;
+          l += p;
+        }
+        rowm[row] = mnew;
+        rowl[row] = l;
+        rowc[row] = corr;
+      } else {
+        for (uint c = 0u; c < TK; ++c) Ps[row * PS + c] = 0.0;
+        rowc[row] = 1.0;
+      }
+    }
+    barrier();
+
+    // ---- phase 3: O = O * corr + P V
+    [[unroll]] for (uint a = 0u; a < NA; ++a) {
+      uint idx = tid + NTH * a;
+      if (idx < BQ * DV4) {
+        uint row = idx / DV4, c4 = idx - row * DV4;
+        vec4 o = acc[a] * rowc[row];
+        for (uint j = 0u; j < nk; ++j) o += Ps[row * PS + j] * Vs[j * DV4 + c4];
+        acc[a] = o;
+      }
+    }
+    barrier();
+  }
+
+  [[unroll]] for (uint a = 0u; a < NA; ++a) {
+    uint idx = tid + NTH * a;
+    if (idx < BQ * DV4) {
+      uint row = idx / DV4, c4 = idx - row * DV4;
+      uint qrow = q0 + row;
+      if (qrow < Lq) {
+        // all keys -inf -> NaN, like softmax of an all -inf row
+        float inv = rowm[row] > -UM_INF ? 1.0 / rowl[row] : UM_NAN;
+        vec4 r = acc[a] * inv;
+        uint g = z * Lq * DV + qrow * DV + c4 * 4u;
+        O[g] = r.x;
+        O[g + 1u] = r.y;
+        O[g + 2u] = r.z;
+        O[g + 3u] = r.w;
+      }
+    }
+  }
+}

@@ -1,0 +1,113 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+// Opt-in reduced-precision GEMM (VulkanBackendOptions::fp16): same contract as
+// gemm.comp, but tiles are rounded to fp16 in shared memory and multiplied on
+// tensor cores (KHR_cooperative_matrix 16x16x16, fp32 accumulation).
+// Workgroup = WM x WN subgroups; each subgroup owns FM x FN 16x16 fragments.
+layout(constant_id = 0) const uint WM = 2;
+layout(constant_id = 1) const uint WN = 2;
+layout(constant_id = 2) const uint FM = 2;
+layout(constant_id = 3) const uint FN = 2;
+layout(constant_id = 4) const uint TRANS_B = 1;
+layout(constant_id = 5) const uint SG = 32;  // subgroup size the host assumed
+layout(local_size_x_id = 6) in;              // WM * WN * SG
+
+layout(binding = 0) readonly buffer A_ { float A[]; };
+layout(binding = 1) readonly buffer B_ { float B[]; };
+layout(binding = 2) readonly buffer Bias_ { float bias[]; };
+layout(binding = 3) writeonly buffer C_ { float C[]; };
+layout(push_constant) uniform PC {
+  uint M; uint N; uint K; uint has_bias;
+  uint nbatch; uint nbd; uint pad0; uint pad1;
+  uint bshape[4]; uint sa[4]; uint sb[4];
+} pc;
+
+const uint BM = WM * FM * 16u;
+const uint BN = WN * FN * 16u;
+const uint BK = 32u;
+const uint NT = WM * WN * SG;
+const uint AS = BK + 8u;  // padded row stride in halves (80 B, 16 B aligned)
+
+shared float16_t As[BM * AS];  // [m][k]
+shared float16_t Bs[BN * AS];  // [n][k]  (B^T, loaded column-major)
+shared float Cw[WM * WN * 256u];
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x;
+  const uint warp = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+  const uint wm = warp / WN, wn = warp % WN;
+  const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+  const uint M = pc.M, N = pc.N, K = pc.K;
+
+  for (uint z = gl_WorkGroupID.z; z < pc.nbatch; z += gl_NumWorkGroups.z) {
+    uint rem = z, offA = 0u, offB = 0u;
+    for (int d = int(pc.nbd) - 1; d >= 0; --d) {
+      uint c = rem % pc.bshape[d];
+      rem /= pc.bshape[d];
+      offA += c * pc.sa[d];
+      offB += c * pc.sb[d];
+    }
+    const uint offC = z * M * N;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FM][FN];
+    [[unroll]] for (uint i = 0u; i < FM; ++i)
+      [[unroll]] for (uint j = 0u; j < FN; ++j)
+        acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+      for (uint e = tid; e < BM * BK; e += NT) {
+        uint r = e / BK, kk = e % BK;
+        uint gm = m0 + r, gk = k0 + kk;
+        As[r * AS + kk] = float16_t((gm < M && gk < K) ? A[offA + gm * K + gk] : 0.0);
+      }
+      if (TRANS_B != 0u) {
+        for (uint e = tid; e < BN * BK; e += NT) {
+          uint r = e / BK, kk = e % BK;
+          uint gn = n0 + r, gk = k0 + kk;
+          Bs[r * AS + kk] = float16_t((gn < N && gk < K) ? B[offB + gn * K + gk] : 0.0);
+        }
+      } else {
+        for (uint e = tid; e < BN * BK; e += NT) {
+          uint kk = e / BN, r = e % BN;
+          uint gn = n0 + r, gk = k0 + kk;
+          Bs[r * AS + kk] = float16_t((gn < N && gk < K) ? B[offB + gk * N + gn] : 0.0);
+        }
+      }
+      barrier();
+      [[unroll]] for (uint kk = 0u; kk < BK; kk += 16u) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[FM];
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[FN];
+        [[unroll]] for (uint i = 0u; i < FM; ++i)
+          coopMatLoad(a[i], As, ((wm * FM + i) * 16u) * AS + kk, AS, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint j = 0u; j < FN; ++j)
+          coopMatLoad(b[j], Bs, ((wn * FN + j) * 16u) * AS + kk, AS, gl_CooperativeMatrixLayoutColumnMajor);
+        [[unroll]] for (uint i = 0u; i < FM; ++i)
+          [[unroll]] for (uint j = 0u; j < FN; ++j) acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+      }
+      barrier();
+    }
+
+    // Epilogue: each subgroup stages one fragment at a time in its own scratch.
+    [[unroll]] for (uint i = 0u; i < FM; ++i)
+      [[unroll]] for (uint j = 0u; j < FN; ++j) {
+        coopMatStore(acc[i][j], Cw, warp * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint e = lane; e < 256u; e += SG) {
+          uint row = m0 + (wm * FM + i) * 16u + e / 16u;
+          uint col = n0 + (wn * FN + j) * 16u + e % 16u;
+          if (row < M && col < N) {
+            float v = Cw[warp * 256u + e];
+            if (pc.has_bias != 0u) v += bias[col];
+            C[offC + row * N + col] = v;
+          }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+      }
+  }
+}

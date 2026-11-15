@@ -1,0 +1,15 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// out[i, r] = table[idx[i], r]
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer T { float table[]; };
+layout(binding = 1) readonly buffer I { int idx[]; };
+layout(binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n; uint rowlen; } pc;
+void main() {
+  uint i = um_linear_group() * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.n) return;
+  uint row = i / pc.rowlen, col = i - row * pc.rowlen;
+  o[i] = table[uint(idx[row]) * pc.rowlen + col];
+}
