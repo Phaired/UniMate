@@ -512,7 +512,7 @@ void App::build_ui(float dt) {
       ImGui::EndDisabled();
     } else {
       ImGui::BeginDisabled(!opt_.generate || !asset_);
-      if (ImGui::Button("Generate", ImVec2(-1, 0))) start_generate();
+      if (ImGui::Button("Generate##run", ImVec2(-1, 0))) start_generate();
       ImGui::EndDisabled();
     }
     if (!opt_.generate) ImGui::TextDisabled("no generator attached");
